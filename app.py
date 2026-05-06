@@ -438,6 +438,8 @@ if run_generate:
             builder.fill_all_slides(
                 st.session_state["module_snapshots"],
                 st.session_state["track_snapshots"],
+                start_date=start_date,
+                end_date=end_date,
             )
 
             ppt_bytes = builder.to_bytes()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import re
 from datetime import date
 from io import BytesIO
 from typing import Dict, List, Optional, Tuple
@@ -57,16 +58,36 @@ class PptStatusReportBuilder:
     def __init__(self, template_bytes: bytes) -> None:
         self.prs = Presentation(BytesIO(template_bytes))
 
+    # ── Cover date pattern ─────────────────────────────────────────────────────
+    # Matches patterns like: "27th Apr – 1st May 2026", "1 May - 7 May 2026",
+    # "Week ending 7th May 2026", "May 1 – May 7, 2026" etc.
+    _DATE_RANGE_RE = re.compile(
+        r"\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}"
+        r"(?:\s+\d{4})?\s*[-\u2013\u2014]\s*"
+        r"\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\s+\d{4}",
+        re.IGNORECASE,
+    )
+    _SINGLE_DATE_RE = re.compile(
+        r"\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]{3,9}\s+\d{4}",
+        re.IGNORECASE,
+    )
+
     # ── Primary entry point ───────────────────────────────────────────────────
 
     def fill_all_slides(
         self,
         module_data: Dict[str, ModuleSnapshot],
         track_snapshots: Dict[str, TrackSnapshot],
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> None:
         slides = list(self.prs.slides)
         if len(slides) < 3:
             return
+
+        # Update cover slide dates before touching content slides
+        if start_date and end_date:
+            self.update_cover_slide(start_date, end_date)
 
         content_slides = slides[1:-1]  # skip cover (idx 0) and last (Thank You)
 
@@ -163,6 +184,68 @@ class PptStatusReportBuilder:
             del_idx, del_slide = positions[0]
             self._delete_slide(del_idx)
             unused.remove(del_slide)
+
+    def update_cover_slide(self, start_date: date, end_date: date) -> None:
+        """Scan slide 0 (cover) for date/duration text and replace with the
+        actual reporting window, preserving all other formatting."""
+        cover = self.prs.slides[0]
+        new_range = (
+            f"{_ordinal(start_date.day)} {start_date.strftime('%b')} "
+            f"\u2013 "
+            f"{_ordinal(end_date.day)} {end_date.strftime('%b')} {end_date.year}"
+        )
+        # Also build a single-date replacement for "Week ending X" style text
+        new_single = f"{_ordinal(end_date.day)} {end_date.strftime('%b')} {end_date.year}"
+
+        for shape in cover.shapes:
+            if not shape.has_text_frame:
+                continue
+            for para in shape.text_frame.paragraphs:
+                # Collapse all run text for detection
+                full_text = "".join(r.text for r in para.runs)
+                if not full_text.strip():
+                    continue
+
+                changed = False
+                if self._DATE_RANGE_RE.search(full_text):
+                    new_text = self._DATE_RANGE_RE.sub(new_range, full_text)
+                    changed = True
+                elif self._SINGLE_DATE_RE.search(full_text):
+                    new_text = self._SINGLE_DATE_RE.sub(new_single, full_text)
+                    changed = True
+                else:
+                    continue
+
+                # Preserve formatting from the first run, rebuild paragraph
+                runs = para.runs
+                if not runs:
+                    continue
+                # Copy key font attrs from first run
+                first_run = runs[0]
+                bold = first_run.font.bold
+                italic = first_run.font.italic
+                size = first_run.font.size
+                try:
+                    color = first_run.font.color.rgb
+                except Exception:
+                    color = None
+
+                # Clear all runs from the paragraph XML
+                from lxml import etree
+                _ns = "http://schemas.openxmlformats.org/drawingml/2006/main"
+                p_elem = para._p
+                for r_elem in p_elem.findall(f"{{{_ns}}}r"):
+                    p_elem.remove(r_elem)
+
+                # Add a single new run with the updated text
+                new_para = para.add_run()
+                new_para.text = new_text
+                new_para.font.bold = bold
+                new_para.font.italic = italic
+                if size:
+                    new_para.font.size = size
+                if color:
+                    new_para.font.color.rgb = color
 
     def to_bytes(self) -> bytes:
         buf = BytesIO()
