@@ -140,6 +140,46 @@ class JiraService:
 
         return tickets
 
+        return tickets
+
+    def fetch_project_statuses(self, project_key: str) -> List[str]:
+        """Return all unique status names configured for Story/Bug issue types in the project."""
+        url = f"{self.server}/rest/api/3/project/{project_key}/statuses"
+        resp = requests.get(url, auth=self.auth, headers={"Accept": "application/json"})
+        resp.raise_for_status()
+        statuses: set = set()
+        for issue_type in resp.json():
+            if issue_type.get("name", "") in ("Story", "Bug", ""):
+                for s in issue_type.get("statuses", []):
+                    name = (s.get("name") or "").strip()
+                    if name:
+                        statuses.add(name)
+        if not statuses:
+            resp2 = requests.get(url, auth=self.auth, headers={"Accept": "application/json"})
+            for issue_type in resp2.json():
+                for s in issue_type.get("statuses", []):
+                    name = (s.get("name") or "").strip()
+                    if name:
+                        statuses.add(name)
+        return sorted(statuses)
+
+    def fetch_project_labels(self, project_key: str) -> List[str]:
+        """Return unique label values from recent Story/Bug tickets (samples up to 300)."""
+        jql = (
+            f'project = "{project_key}" AND issuetype IN (Story, Bug) '
+            "ORDER BY updated DESC"
+        )
+        payload = {"jql": jql, "maxResults": 300, "fields": ["labels"]}
+        url = f"{self.server}/rest/api/3/search/jql"
+        resp = requests.post(url, json=payload, auth=self.auth, headers=self.headers)
+        resp.raise_for_status()
+        labels: set = set()
+        for issue in resp.json().get("issues", []):
+            for lbl in (issue.get("fields", {}).get("labels") or []):
+                if lbl and lbl.strip():
+                    labels.add(lbl.strip())
+        return sorted(labels)
+
     def _fetch_changelog(self, issue_key: str) -> Dict[str, List[datetime]]:
         """Fetch all status transitions for an issue via the changelog endpoint."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}/changelog"

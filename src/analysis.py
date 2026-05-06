@@ -6,7 +6,7 @@ from typing import Dict, Iterable, List
 
 from openai import OpenAI
 
-from .models import EXCLUDED_CARRY_OVER_STATUSES, JiraTicket, ModuleSnapshot, TrackSnapshot
+from .models import EXCLUDED_CARRY_OVER_STATUSES, JiraTicket, ModuleSnapshot, StatusConfig, TrackSnapshot
 
 DEPENDENCY_PATTERN = re.compile(r"\b(depends on|blocked by|waiting for|dependency|external)\b", re.IGNORECASE)
 
@@ -17,7 +17,13 @@ def ticket_in_window(ts: datetime | None, start: datetime, end: datetime) -> boo
     return start <= ts <= end
 
 
-def build_module_snapshots(tickets: List[JiraTicket], start_date, end_date) -> Dict[str, ModuleSnapshot]:
+def build_module_snapshots(
+    tickets: List[JiraTicket],
+    start_date,
+    end_date,
+    status_config: StatusConfig | None = None,
+) -> Dict[str, ModuleSnapshot]:
+    cfg = status_config or StatusConfig()
     start = datetime.combine(start_date, time.min)
     end = datetime.combine(end_date, time.max)
 
@@ -26,17 +32,23 @@ def build_module_snapshots(tickets: List[JiraTicket], start_date, end_date) -> D
         module = ticket.module or "Unmapped"
         snapshot = buckets.setdefault(module, ModuleSnapshot(module=module))
 
-        if ticket.created_at and ticket.created_at < start and ticket.status not in EXCLUDED_CARRY_OVER_STATUSES:
+        if ticket.created_at and ticket.created_at < start and ticket.status not in cfg.excluded_carry_over:
             snapshot.carried_over.append(ticket)
         if ticket_in_window(ticket.created_at, start, end):
             snapshot.created_in_period.append(ticket)
 
-        if has_transition_in_window(ticket, "Deployed to UAT", start, end):
-            snapshot.moved_to_uat.append(ticket)
-        if has_transition_in_window(ticket, "Deployed to Production", start, end):
-            snapshot.moved_to_prod.append(ticket)
-        if has_transition_in_window(ticket, "Ready for QA", start, end):
-            snapshot.moved_to_ready_qa.append(ticket)
+        for uat_status in cfg.uat_statuses:
+            if has_transition_in_window(ticket, uat_status, start, end):
+                snapshot.moved_to_uat.append(ticket)
+                break
+        for prod_status in cfg.prod_statuses:
+            if has_transition_in_window(ticket, prod_status, start, end):
+                snapshot.moved_to_prod.append(ticket)
+                break
+        for qa_status in cfg.ready_qa_statuses:
+            if has_transition_in_window(ticket, qa_status, start, end):
+                snapshot.moved_to_ready_qa.append(ticket)
+                break
 
     return dict(sorted(buckets.items(), key=lambda kv: kv[0].lower()))
 

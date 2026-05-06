@@ -5,12 +5,30 @@ from datetime import date, datetime
 from typing import Dict, List
 
 
+# Default status sets — preserved for backward compatibility
 EXCLUDED_CARRY_OVER_STATUSES = {
     "On Hold",
     "Discarded",
     "Done/Sign-Off",
     "Deployed to Production",
 }
+
+
+@dataclass
+class StatusConfig:
+    """User-configurable status groupings for bucketing in the analysis layer."""
+    excluded_carry_over: frozenset = field(
+        default_factory=lambda: frozenset(EXCLUDED_CARRY_OVER_STATUSES)
+    )
+    uat_statuses: frozenset = field(
+        default_factory=lambda: frozenset({"Deployed to UAT"})
+    )
+    prod_statuses: frozenset = field(
+        default_factory=lambda: frozenset({"Deployed to Production"})
+    )
+    ready_qa_statuses: frozenset = field(
+        default_factory=lambda: frozenset({"Ready for QA"})
+    )
 
 
 @dataclass
