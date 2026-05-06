@@ -1,0 +1,9 @@
+streamlit==1.45.1
+pandas==2.2.3
+python-dateutil==2.9.0.post0
+python-pptx==1.0.2
+openai==1.78.1
+python-dotenv==1.0.1
+requests==2.33.1
+lxml==6.1.0
+
