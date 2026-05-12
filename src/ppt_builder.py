@@ -49,8 +49,9 @@ class PptStatusReportBuilder:
     - DETAIL slide : module header (TextBox 8) + a/b/c/d/e ticket sections
 
     Rules:
-    - Slide 0 (cover) and the last slide (Thank You) are never touched.
-    - All content slides are flushed to just their header (TextBox 8) before filling.
+    - Slide 0 is normalized and date-corrected if needed.
+    - Last slide (often Thank You) is not filled with module data.
+    - Content slides are cleared in a template-agnostic way while preserving layout visuals.
     - Unused content slides (no matching module data) are deleted from the output.
     - SLCM tickets are merged onto the Education Cloud Student Success slide.
     """
@@ -106,6 +107,12 @@ class PptStatusReportBuilder:
                 skip_ids.add(id(snap))
             assigned[idx] = snap
 
+        # Template-agnostic fallback: if no title matching worked, map modules by order.
+        if module_data and not any(s is not None for s in assigned.values()):
+            ordered = [module_data[name] for name in sorted(module_data.keys(), key=lambda n: n.lower())]
+            for idx, snap in zip(range(len(content_slides)), ordered):
+                assigned[idx] = snap
+
         # ── Merge all unmatched SLCM snapshots → Education Cloud Student Success ─
         slcm_snaps = [
             snap for name, snap in module_data.items()
@@ -151,6 +158,14 @@ class PptStatusReportBuilder:
             snap = assigned[content_idx]
             count_slide = content_slides[content_idx]
             count_prs_idx = self._slide_index(count_slide)
+            has_dependency_items = self._snapshot_has_dependency_items(snap)
+
+            # Always fill count slide (summary table)
+            self._fill_count_slide(count_slide, snap)
+
+            # Only add dependency detail slide when there are matched dependency tickets.
+            if not has_dependency_items:
+                continue
 
             # Clone the flushed slide → becomes the detail slide (appended at end)
             self._clone_slide(count_slide)  # adds at end
@@ -161,8 +176,7 @@ class PptStatusReportBuilder:
             if detail_prs_idx != target_pos:
                 self._move_slide(detail_prs_idx, target_pos)
 
-            # Fill count slide (summary table) and detail slide (ticket sections)
-            self._fill_count_slide(count_slide, snap)
+            # Fill dependency-focused detail slide
             self._fill_detail_slide(self.prs.slides[count_prs_idx + 1], snap)
 
         # ── Step 4: Delete unused content slides ────────────────────────────
@@ -197,6 +211,17 @@ class PptStatusReportBuilder:
         # Also build a single-date replacement for "Week ending X" style text
         new_single = f"{_ordinal(end_date.day)} {end_date.strftime('%b')} {end_date.year}"
 
+        full_cover_text = " ".join(
+            (sh.text_frame.text or "").strip()
+            for sh in cover.shapes
+            if sh.has_text_frame
+        ).strip()
+        meaningful_words = [w for w in re.findall(r"[A-Za-z]+", full_cover_text) if len(w) > 2]
+        if len(meaningful_words) < 4:
+            self._rewrite_cover_slide(cover, new_range)
+            return
+
+        changed_any = False
         for shape in cover.shapes:
             if not shape.has_text_frame:
                 continue
@@ -246,6 +271,46 @@ class PptStatusReportBuilder:
                     new_para.font.size = size
                 if color:
                     new_para.font.color.rgb = color
+                changed_any = True
+
+        if not changed_any:
+            # If no date-like text exists, append a clean reporting-window line.
+            tx = cover.shapes.add_textbox(Inches(0.8), Inches(5.6), Inches(11.7), Inches(0.6))
+            tf = tx.text_frame
+            tf.clear()
+            p = tf.paragraphs[0]
+            run = p.add_run()
+            run.text = f"Reporting Window: {new_range}"
+            run.font.size = Pt(20)
+            run.font.bold = True
+            run.font.color.rgb = DARK_BLUE
+
+    @staticmethod
+    def _rewrite_cover_slide(cover_slide, window_text: str) -> None:
+        """If cover text is unusable, build a clean title/date overlay."""
+        for sh in cover_slide.shapes:
+            if sh.has_text_frame:
+                sh.text_frame.clear()
+
+        title_box = cover_slide.shapes.add_textbox(Inches(0.8), Inches(1.8), Inches(11.8), Inches(1.2))
+        tf_t = title_box.text_frame
+        tf_t.clear()
+        p1 = tf_t.paragraphs[0]
+        r1 = p1.add_run()
+        r1.text = "Weekly Status Report"
+        r1.font.size = Pt(44)
+        r1.font.bold = True
+        r1.font.color.rgb = DARK_BLUE
+
+        sub_box = cover_slide.shapes.add_textbox(Inches(0.8), Inches(3.2), Inches(11.8), Inches(0.8))
+        tf_s = sub_box.text_frame
+        tf_s.clear()
+        p2 = tf_s.paragraphs[0]
+        r2 = p2.add_run()
+        r2.text = f"Reporting Window: {window_text}"
+        r2.font.size = Pt(24)
+        r2.font.bold = True
+        r2.font.color.rgb = DARK_BLUE
 
     def to_bytes(self) -> bytes:
         buf = BytesIO()
@@ -255,17 +320,37 @@ class PptStatusReportBuilder:
     # ── Slide writers ─────────────────────────────────────────────────────────
 
     def _fill_count_slide(self, slide, snapshot: ModuleSnapshot) -> None:
-        """Count slide: TextBox 8 header already present; add centred count table."""
+        """Count slide: ensure header exists, then add centred count table."""
+        self._ensure_slide_header(slide, snapshot.module)
         self._underline_slide_header(slide)
         self._insert_count_table_centred(slide, snapshot)
 
     def _fill_detail_slide(self, slide, snapshot: ModuleSnapshot) -> None:
-        """Detail slide: TextBox 8 header already present; add ticket sections."""
+        """Detail slide: ensure header exists, then add ticket sections."""
+        self._flush_slide(slide)  # Remove count table and other content inherited from clone
+        self._ensure_slide_header(slide, snapshot.module)
+        self._set_detail_slide_header(slide, snapshot.module)
         self._underline_slide_header(slide)
         txBox = slide.shapes.add_textbox(Inches(0.4), Inches(1.4), Inches(12.5), Inches(5.5))
         tf = txBox.text_frame
         tf.word_wrap = True
         self._write_sections_to_tf(tf, snapshot)
+
+    @staticmethod
+    def _snapshot_has_dependency_items(snapshot: ModuleSnapshot) -> bool:
+        """True when any ticket in the module has a matched linked dependency."""
+        buckets = (
+            snapshot.carried_over,
+            snapshot.created_in_period,
+            snapshot.moved_to_uat,
+            snapshot.moved_to_prod,
+            snapshot.moved_to_ready_qa,
+        )
+        for bucket in buckets:
+            for ticket in bucket:
+                if ticket.linked_dependency_keys:
+                    return True
+        return False
 
     def _write_sections_to_tf(self, tf, snapshot: ModuleSnapshot) -> None:
         self._clear_tf(tf)
@@ -282,17 +367,14 @@ class PptStatusReportBuilder:
         # Flat list: (text, bold, italic, size_pt, color|None)
         lines: List[Tuple] = []
         for section_title, tickets in sections:
+            dep_tickets = [t for t in tickets if t.linked_dependency_keys]
             lines.append((section_title, True, False, True, 10, DARK_BLUE))
-            if not tickets:
+            if not dep_tickets:
                 lines.append(("  – None", False, False, False, 9, None))
             else:
-                for ticket in tickets[:8]:
+                for ticket in dep_tickets[:8]:
                     summary = ticket.ai_summary or ticket.summary
                     lines.append((f"  – {ticket.key}: {summary}", False, False, False, 9, None))
-                    # Highlight first dependency in red italic
-                    for dep in ticket.dependencies[:1]:
-                        dep_str = dep[:180] + ("…" if len(dep) > 180 else "")
-                        lines.append((f"    ↳ Dependency: {dep_str}", False, True, False, 8, ACCENT_RED))
             lines.append(("", False, False, False, 7, None))  # section spacer
 
         self._write_lines(tf, lines)
@@ -405,13 +487,14 @@ class PptStatusReportBuilder:
 
     @staticmethod
     def _underline_slide_header(slide) -> None:
-        """Underline module header text in TextBox 8 for detail slides."""
-        for sh in slide.shapes:
-            if sh.name == "TextBox 8" and sh.has_text_frame:
-                tf = sh.text_frame
-                for p in tf.paragraphs:
-                    for r in p.runs:
-                        r.font.underline = True
+        """Underline likely header text for detail slides across template variants."""
+        header = PptStatusReportBuilder._get_header_shape(slide)
+        if not header or not header.has_text_frame:
+            return
+        tf = header.text_frame
+        for p in tf.paragraphs:
+            for r in p.runs:
+                r.font.underline = True
 
     @staticmethod
     def _clear_tf(tf) -> None:
@@ -428,9 +511,15 @@ class PptStatusReportBuilder:
     # ── Slide management helpers ──────────────────────────────────────────────
 
     def _flush_slide(self, slide) -> None:
-        """Remove all shapes from a content slide except the TextBox 8 header."""
+        """Clear content in a template-agnostic way while keeping visual scaffolding."""
+        header_shape = self._get_header_shape(slide)
         sp_tree = slide.shapes._spTree
-        to_remove = [sh._element for sh in slide.shapes if sh.name != "TextBox 8"]
+        to_remove = []
+        for sh in slide.shapes:
+            if header_shape is not None and sh is header_shape:
+                continue
+            if sh.has_text_frame or sh.has_table:
+                to_remove.append(sh._element)
         for el in to_remove:
             sp_tree.remove(el)
 
@@ -481,18 +570,70 @@ class PptStatusReportBuilder:
         for ph in slide.placeholders:
             if ph.placeholder_format.idx == 0:
                 return ph.text or ""
-        # Fallback: read module name from TextBox 8 (template header shape)
-        for sh in slide.shapes:
-            if sh.name == "TextBox 8" and sh.has_text_frame:
-                t = sh.text_frame.text.strip()
-                if t:
-                    # "Status – Admissions Module" → "Admissions Module"
-                    if "\u2013" in t:  # en-dash
-                        return t.split("\u2013", 1)[-1].strip()
-                    if "-" in t and t.lower().startswith("status"):
-                        return t.split("-", 1)[-1].strip()
-                    return t
+        # Fallback: read text from likely header shape
+        sh = self._get_header_shape(slide)
+        if sh is not None and sh.has_text_frame:
+            t = sh.text_frame.text.strip()
+            if t:
+                if "\u2013" in t:
+                    return t.split("\u2013", 1)[-1].strip()
+                if "-" in t and t.lower().startswith("status"):
+                    return t.split("-", 1)[-1].strip()
+                return t
         return ""
+
+    @staticmethod
+    def _get_header_shape(slide):
+        """Best-effort header finder that works across templates."""
+        if slide.shapes.title and slide.shapes.title.has_text_frame:
+            return slide.shapes.title
+
+        candidates = [
+            sh for sh in slide.shapes
+            if sh.has_text_frame and (sh.text_frame.text or "").strip()
+        ]
+        if not candidates:
+            return None
+
+        # Prefer top-most text shape with meaningful short title-like text.
+        candidates.sort(key=lambda s: (s.top, -(s.width * s.height)))
+        return candidates[0]
+
+    @staticmethod
+    def _ensure_slide_header(slide, module_name: str):
+        """Create a header when template does not provide one."""
+        existing = PptStatusReportBuilder._get_header_shape(slide)
+        if existing is not None:
+            txt = (existing.text_frame.text or "").strip() if existing.has_text_frame else ""
+            if txt:
+                return existing
+
+        header = slide.shapes.add_textbox(Inches(0.45), Inches(0.35), Inches(12.0), Inches(0.7))
+        tf = header.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        r = p.add_run()
+        r.text = f"Status - {module_name}"
+        r.font.size = Pt(22)
+        r.font.bold = True
+        r.font.color.rgb = DARK_BLUE
+        return header
+
+    @staticmethod
+    def _set_detail_slide_header(slide, module_name: str) -> None:
+        """Retitle detail slide to indicate dependency-focused content."""
+        header = PptStatusReportBuilder._get_header_shape(slide)
+        if header is None or not header.has_text_frame:
+            return
+
+        tf = header.text_frame
+        tf.clear()
+        p = tf.paragraphs[0]
+        run = p.add_run()
+        run.text = f"Status - {module_name} (Dependency Summary)"
+        run.font.size = Pt(22)
+        run.font.bold = True
+        run.font.color.rgb = DARK_BLUE
 
     def _get_body_placeholder(self, slide):
         """Return the primary body placeholder (prefer idx=1, then largest)."""
