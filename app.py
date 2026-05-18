@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -16,6 +18,10 @@ from src.ppt_builder import PptStatusReportBuilder, build_output_filename
 st.set_page_config(page_title="Automated WSR Generator", layout="wide")
 st.title("Automated WSR Generator")
 st.caption("Jira-driven Weekly/Fortnightly status report with AI summarization and PPT output.")
+
+APP_VERSION = "2026.05.18.1"
+APP_BUILD_SHA = (os.getenv("GITHUB_SHA") or "local")[:7]
+st.caption(f"Build: {APP_VERSION} ({APP_BUILD_SHA})")
 
 settings = load_settings()
 
@@ -61,6 +67,7 @@ _DEFAULT_LABEL_MAPPING = (
     "leads=AMS Non-Admissions Module\n"
     "security_review=AMS Non-Admissions Module\n"
     "digitallearning=Executive Education\n"
+    "exec_ed=Executive Education\n"
     "oppo=Executive Education\n"
     "SFMC=SFMC\n"
     "marketing=SFMC"
@@ -82,12 +89,219 @@ def _detect_provider(model):
     return "OpenAI", "https://api.openai.com/v1"
 
 
+@st.cache_resource
+def _get_fetch_executor() -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=1)
+
+
+def _has_linked_dependencies(ticket) -> bool:
+    return bool(getattr(ticket, "linked_dependency_keys", []) or [])
+
+
+def _normalize_ticket_schema(ticket) -> None:
+    if not hasattr(ticket, "linked_dependency_keys") or getattr(ticket, "linked_dependency_keys") is None:
+        setattr(ticket, "linked_dependency_keys", [])
+    if not hasattr(ticket, "dependencies") or getattr(ticket, "dependencies") is None:
+        setattr(ticket, "dependencies", [])
+    if not hasattr(ticket, "ai_summary") or getattr(ticket, "ai_summary") is None:
+        setattr(ticket, "ai_summary", "")
+
+
+def _run_fetch_pipeline(
+    *,
+    jira_server: str,
+    jira_email: str,
+    jira_token: str,
+    jira_project: str,
+    module_source: str,
+    jira_module_field: str,
+    module_label_prefix: str,
+    label_module_map: dict,
+    cutoff_date,
+    start_date,
+    end_date,
+    active_sprints_only: bool,
+    model: str,
+    openai_api_key: str,
+    openai_base_url: str,
+    excl_statuses,
+    uat_statuses_sel,
+    prod_statuses_sel,
+    ready_qa_statuses_sel,
+    on_progress,
+):
+    if not jira_server.startswith(("http://", "https://")):
+        raise ValueError(f"Invalid Jira server URL. Must start with http:// or https://. Got: {jira_server}")
+
+    on_progress("Connecting to Jira...")
+    service = JiraService(
+        jira_server,
+        jira_email,
+        jira_token,
+        module_source=module_source,
+        module_field=jira_module_field,
+        module_label_prefix=module_label_prefix,
+        label_module_map=label_module_map,
+    )
+
+    tickets = service.fetch_story_bug_tickets(
+        jira_project,
+        cutoff_date,
+        start_date=start_date,
+        on_progress=on_progress,
+        active_sprints_only=active_sprints_only,
+    )
+
+    linked_keys = {
+        dep_key
+        for t in tickets
+        for dep_key in (getattr(t, "linked_dependency_keys", []) or [])
+    }
+    dep_map = service.fetch_dependency_todo_tickets(
+        jira_project,
+        linked_keys=linked_keys,
+        on_progress=on_progress,
+    )
+    on_progress(f"Matched Dependency tickets (To Do): {len(dep_map)}")
+
+    for t in tickets:
+        _normalize_ticket_schema(t)
+        t.linked_dependency_keys = [
+            k for k in (t.linked_dependency_keys or []) if k in dep_map
+        ]
+
+    matched_tickets = [t for t in tickets if _has_linked_dependencies(t)]
+    for ticket in tickets:
+        ticket.ai_summary = ""
+
+    if not matched_tickets:
+        on_progress("No tickets with matched open dependencies were sent to AI.")
+
+    for i, ticket in enumerate(matched_tickets, 1):
+        on_progress(f"AI summary: {ticket.key} ({i}/{len(matched_tickets)})")
+        ticket.dependencies = derive_dependencies(
+            ticket,
+            dependency_tickets_by_key=dep_map,
+        )
+        ticket.ai_summary = summarize_ticket_with_ai(
+            ticket=ticket,
+            model=model,
+            api_key=openai_api_key,
+            base_url=openai_base_url,
+            dependency_tickets_by_key=dep_map,
+        )
+
+    status_cfg = StatusConfig(
+        excluded_carry_over=frozenset(excl_statuses),
+        uat_statuses=frozenset(uat_statuses_sel),
+        prod_statuses=frozenset(prod_statuses_sel),
+        ready_qa_statuses=frozenset(ready_qa_statuses_sel),
+    )
+    module_snapshots = build_module_snapshots(
+        tickets,
+        start_date,
+        end_date,
+        status_config=status_cfg,
+    )
+    track_snapshots = build_track_snapshots(tickets, start_date, end_date)
+
+    return {
+        "tickets": tickets,
+        "dependency_tickets": dep_map,
+        "status_config": status_cfg,
+        "module_snapshots": module_snapshots,
+        "track_snapshots": track_snapshots,
+        "matched_count": len(matched_tickets),
+        "skipped_count": len(tickets) - len(matched_tickets),
+    }
+
+
 if "label_map_raw" not in st.session_state:
     st.session_state["label_map_raw"] = _DEFAULT_LABEL_MAPPING
 if "_prev_provider" not in st.session_state:
     st.session_state["_prev_provider"] = ""
 if "_provider_base_url" not in st.session_state:
     st.session_state["_provider_base_url"] = settings.openai_base_url
+if "template_bytes" not in st.session_state:
+    st.session_state["template_bytes"] = None
+if "template_name" not in st.session_state:
+    st.session_state["template_name"] = ""
+if "fetch_running" not in st.session_state:
+    st.session_state["fetch_running"] = False
+if "fetch_future" not in st.session_state:
+    st.session_state["fetch_future"] = None
+if "fetch_logs" not in st.session_state:
+    st.session_state["fetch_logs"] = []
+if "fetch_meta" not in st.session_state:
+    st.session_state["fetch_meta"] = {}
+
+
+@st.fragment(run_every="2s")
+def _render_fetch_status(start_date, end_date, jira_project, module_source, jira_server):
+    if not (st.session_state.get("fetch_running") and st.session_state.get("fetch_future") is not None):
+        return
+
+    with st.status("Running fetch pipeline...", expanded=True) as status:
+        meta = st.session_state.get("fetch_meta", {})
+        st.write(f"**Window:** {meta.get('window', f'{start_date} to {end_date}')}")
+        st.write(f"**Project:** {meta.get('project', jira_project)}  |  **Module source:** {meta.get('module_source', module_source)}")
+        st.write(f"**Jira Server:** {meta.get('jira_server', jira_server)}")
+
+        logs = st.session_state.get("fetch_logs", [])
+        if logs:
+            st.code("\n".join(logs[-12:]), language=None)
+
+        future = st.session_state["fetch_future"]
+        if future.done():
+            try:
+                result = future.result()
+                tickets = result["tickets"]
+                for t in tickets:
+                    _normalize_ticket_schema(t)
+
+                st.session_state["tickets"] = tickets
+                st.session_state["dependency_tickets"] = result["dependency_tickets"]
+                st.session_state["status_config"] = result["status_config"]
+                st.session_state["module_snapshots"] = result["module_snapshots"]
+                st.session_state["track_snapshots"] = result["track_snapshots"]
+
+                if not tickets:
+                    status.update(label="No tickets found", state="error")
+                    st.warning(
+                        f"No Story/Bug tickets found for project '{meta.get('project', jira_project)}' in window "
+                        f"{meta.get('window', f'{start_date} to {end_date}')}. Verify: Jira server URL, project key, credentials, and active sprint status."
+                    )
+                else:
+                    st.write(
+                        f"**AI summarisation** - processing {result['matched_count']} tickets with matched open dependencies; "
+                        f"skipping {result['skipped_count']} tickets without matched open dependencies."
+                    )
+                    status.update(label=f"Done - {len(tickets)} tickets fetched and summarised.", state="complete")
+            except ConnectionResetError as e:
+                status.update(label="Connection lost", state="error")
+                st.error(
+                    f"**Connection Reset by Jira Server.** This usually means:\n"
+                    f"- Jira server URL is incorrect or unreachable\n"
+                    f"- Network/firewall is blocking the connection\n"
+                    f"- Jira API credentials are invalid (check email & token)\n\n"
+                    f"**Details:** {e}"
+                )
+            except ValueError as e:
+                status.update(label="Invalid input", state="error")
+                st.error(f"**Invalid configuration:** {e}")
+            except Exception as exc:
+                status.update(label="Fetch failed", state="error")
+                st.error(
+                    f"**Fetch failed:** {type(exc).__name__}\n\n"
+                    f"{exc}\n\n"
+                    "Check Jira connectivity, API token validity, and network access."
+                )
+            finally:
+                st.session_state["fetch_running"] = False
+                st.session_state["fetch_future"] = None
+        else:
+            status.update(label="Running fetch pipeline in background...", state="running")
+            st.info("Jira sync is running in background. This panel refreshes automatically every 2 seconds.")
 
 # SIDEBAR
 with st.sidebar:
@@ -272,7 +486,29 @@ with st.sidebar:
     st.session_state["_provider_base_url"] = openai_base_url
 
 # MAIN CONTENT
-uploaded_template = st.file_uploader("Upload PowerPoint Template (.pptx)", type=["pptx"])
+with st.form("template_upload_form", clear_on_submit=False):
+    uploaded_template = st.file_uploader(
+        "Upload PowerPoint Template (.pptx)",
+        type=["pptx"],
+        key="template_uploader",
+    )
+    use_template = st.form_submit_button(
+        "Use This Template",
+        disabled=False,
+    )
+
+if use_template:
+    if uploaded_template is None:
+        st.warning("Please choose a template first.")
+    else:
+        st.session_state["template_bytes"] = uploaded_template.getvalue()
+        st.session_state["template_name"] = uploaded_template.name
+        st.success(f"Template selected: {uploaded_template.name}")
+        if st.session_state.get("fetch_running"):
+            st.info("Template saved while Jira sync continues in background.")
+
+if st.session_state.get("template_bytes"):
+    st.caption(f"Active template: {st.session_state.get('template_name', 'uploaded file')}")
 
 fetch_col, gen_col = st.columns([1, 1])
 with fetch_col:
@@ -283,115 +519,72 @@ with gen_col:
 if run_fetch:
     if not all([jira_server, jira_email, jira_token, jira_project]):
         st.error("Jira connectivity inputs are required.")
+    elif st.session_state.get("fetch_running"):
+        st.warning("A Jira sync is already running in the background.")
     else:
-        with st.status("Running fetch pipeline...", expanded=True) as status:
-            try:
-                if not jira_server.startswith(("http://", "https://")):
-                    raise ValueError(f"Invalid Jira server URL. Must start with http:// or https://. Got: {jira_server}")
+        label_module_map = {}
+        for line in label_map_raw.splitlines():
+            line = line.strip()
+            if "=" in line:
+                k, _, v = line.partition("=")
+                if k.strip():
+                    label_module_map[k.strip()] = v.strip()
 
-                label_module_map = {}
-                for line in label_map_raw.splitlines():
-                    line = line.strip()
-                    if "=" in line:
-                        k, _, v = line.partition("=")
-                        if k.strip():
-                            label_module_map[k.strip()] = v.strip()
+        st.session_state["fetch_logs"] = []
+        fetch_logs = st.session_state["fetch_logs"]
 
-                st.write(f"**Window:** {start_date} to {end_date}")
-                st.write(f"**Project:** {jira_project}  |  **Module source:** {module_source}")
-                st.write(f"**Jira Server:** {jira_server}")
+        def on_progress(msg):
+            fetch_logs.append(msg)
 
-                log_area = st.empty()
-                log_lines = []
+        st.session_state["fetch_meta"] = {
+            "window": f"{start_date} to {end_date}",
+            "project": jira_project,
+            "module_source": module_source,
+            "jira_server": jira_server,
+        }
+        st.session_state["fetch_future"] = _get_fetch_executor().submit(
+            _run_fetch_pipeline,
+            jira_server=jira_server,
+            jira_email=jira_email,
+            jira_token=jira_token,
+            jira_project=jira_project,
+            module_source=module_source,
+            jira_module_field=jira_module_field,
+            module_label_prefix=module_label_prefix,
+            label_module_map=label_module_map,
+            cutoff_date=cutoff_date,
+            start_date=start_date,
+            end_date=end_date,
+            active_sprints_only=active_sprints_only,
+            model=model,
+            openai_api_key=openai_api_key,
+            openai_base_url=openai_base_url,
+            excl_statuses=excl_statuses,
+            uat_statuses_sel=uat_statuses_sel,
+            prod_statuses_sel=prod_statuses_sel,
+            ready_qa_statuses_sel=ready_qa_statuses_sel,
+            on_progress=on_progress,
+        )
+        st.session_state["fetch_running"] = True
 
-                def on_progress(msg):
-                    log_lines.append(msg)
-                    log_area.code("\n".join(log_lines[-12:]), language=None)
-
-                on_progress("Connecting to Jira...")
-                service = JiraService(
-                    jira_server,
-                    jira_email,
-                    jira_token,
-                    module_source=module_source,
-                    module_field=jira_module_field,
-                    module_label_prefix=module_label_prefix,
-                    label_module_map=label_module_map,
-                )
-
-                tickets = service.fetch_story_bug_tickets(
-                    jira_project, cutoff_date, start_date=start_date,
-                    on_progress=on_progress,
-                    active_sprints_only=active_sprints_only,
-                )
-
-                if not tickets:
-                    status.update(label="No tickets found", state="error")
-                    st.warning(
-                        f"No Story/Bug tickets found for project '{jira_project}' in window "
-                        f"{start_date} to {end_date}. Verify: Jira server URL, project key, credentials, and active sprint status."
-                    )
-                else:
-                    st.write(f"**AI summarisation** - processing {len(tickets)} tickets...")
-                    ai_bar = st.progress(0, text="Starting AI summaries...")
-                    for i, ticket in enumerate(tickets, 1):
-                        ai_bar.progress(i / len(tickets), text=f"AI summary: {ticket.key} ({i}/{len(tickets)})")
-                        ticket.dependencies = derive_dependencies(ticket)
-                        ticket.ai_summary = summarize_ticket_with_ai(
-                            ticket=ticket,
-                            model=model,
-                            api_key=openai_api_key,
-                            base_url=openai_base_url,
-                        )
-                    ai_bar.progress(1.0, text=f"AI summaries complete - {len(tickets)} tickets done.")
-
-                    _status_cfg = StatusConfig(
-                        excluded_carry_over=frozenset(excl_statuses),
-                        uat_statuses=frozenset(uat_statuses_sel),
-                        prod_statuses=frozenset(prod_statuses_sel),
-                        ready_qa_statuses=frozenset(ready_qa_statuses_sel),
-                    )
-                    st.session_state["tickets"] = tickets
-                    st.session_state["status_config"] = _status_cfg
-                    st.session_state["module_snapshots"] = build_module_snapshots(
-                        tickets, start_date, end_date, status_config=_status_cfg
-                    )
-                    st.session_state["track_snapshots"] = build_track_snapshots(tickets, start_date, end_date)
-                    status.update(label=f"Done - {len(tickets)} tickets fetched and summarised.", state="complete")
-
-            except ConnectionResetError as e:
-                status.update(label="Connection lost", state="error")
-                st.error(
-                    f"**Connection Reset by Jira Server.** This usually means:\n"
-                    f"- Jira server URL is incorrect or unreachable\n"
-                    f"- Network/firewall is blocking the connection\n"
-                    f"- Jira API credentials are invalid (check email & token)\n\n"
-                    f"**Details:** {e}"
-                )
-            except ValueError as e:
-                status.update(label="Invalid input", state="error")
-                st.error(f"**Invalid configuration:** {e}")
-            except Exception as exc:
-                status.update(label="Fetch failed", state="error")
-                st.error(
-                    f"**Fetch failed:** {type(exc).__name__}\n\n"
-                    f"{exc}\n\n"
-                    "Check Jira connectivity, API token validity, and network access."
-                )
+_render_fetch_status(start_date, end_date, jira_project, module_source, jira_server)
 
 if "tickets" in st.session_state:
     st.subheader("5) Review and Edit Generated Content")
 
     rows = []
     for ticket in st.session_state["tickets"]:
+        _normalize_ticket_schema(ticket)
+        labels = getattr(ticket, "labels", []) or []
+        is_slcm = any("slcm" in str(label).lower() for label in labels)
         rows.append({
-            "Module": ticket.module,
-            "Track": "SLCM" if ticket.is_slcm else "AMS",
-            "Key": ticket.key,
-            "Type": ticket.issue_type,
-            "Status": ticket.status,
-            "Summary (editable)": ticket.ai_summary,
-            "Dependencies": " | ".join(ticket.dependencies),
+            "Module": getattr(ticket, "module", "Unmapped"),
+            "Track": "SLCM" if is_slcm else "AMS",
+            "Key": getattr(ticket, "key", ""),
+            "Type": getattr(ticket, "issue_type", ""),
+            "Status": getattr(ticket, "status", ""),
+            "Summary (editable)": getattr(ticket, "ai_summary", ""),
+            "Dependencies": " | ".join(getattr(ticket, "dependencies", []) or []),
         })
 
     df = pd.DataFrame(rows)
@@ -428,13 +621,15 @@ if "tickets" in st.session_state:
     st.dataframe(pd.DataFrame(track_rows), hide_index=True)
 
 if run_generate:
-    if uploaded_template is None:
+    if not st.session_state.get("template_bytes"):
         st.error("Please upload the PowerPoint template first.")
     elif "module_snapshots" not in st.session_state or "track_snapshots" not in st.session_state:
         st.error("Please fetch Jira data and review summaries before generating PPT.")
     else:
+        for ticket in st.session_state.get("tickets", []):
+            _normalize_ticket_schema(ticket)
         with st.spinner("Generating PowerPoint report from template..."):
-            builder = PptStatusReportBuilder(uploaded_template.getvalue())
+            builder = PptStatusReportBuilder(st.session_state["template_bytes"])
             builder.fill_all_slides(
                 st.session_state["module_snapshots"],
                 st.session_state["track_snapshots"],

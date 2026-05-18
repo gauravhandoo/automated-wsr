@@ -348,7 +348,7 @@ class PptStatusReportBuilder:
         )
         for bucket in buckets:
             for ticket in bucket:
-                if ticket.linked_dependency_keys:
+                if getattr(ticket, "linked_dependency_keys", []):
                     return True
         return False
 
@@ -367,7 +367,7 @@ class PptStatusReportBuilder:
         # Flat list: (text, bold, italic, size_pt, color|None)
         lines: List[Tuple] = []
         for section_title, tickets in sections:
-            dep_tickets = [t for t in tickets if t.linked_dependency_keys]
+            dep_tickets = [t for t in tickets if getattr(t, "linked_dependency_keys", [])]
             lines.append((section_title, True, False, True, 10, DARK_BLUE))
             if not dep_tickets:
                 lines.append(("  – None", False, False, False, 9, None))

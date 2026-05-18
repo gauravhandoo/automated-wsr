@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, List
 
 import requests
 from requests.auth import HTTPBasicAuth
 
-from .models import JiraTask, JiraTicket
+from .models import JiraTask, JiraTicket, StatusTransition
 
 
 LABEL_SET_ADMISSIONS = {"amp", "cohort", "scholarship", "admissions_support"}
-LABEL_SET_EXEC_ED = {"digitallearning", "oppo"}
+LABEL_SET_EXEC_ED = {"digitallearning", "oppo", "exec_ed"}
 LABEL_SET_SFMC = {"sfmc", "marketing"}
 LABEL_SET_AMS = {
     "ams_support",
@@ -25,6 +25,8 @@ LABEL_SET_AMS = {
     "leads",
     "security_review",
 }
+
+REQUEST_TIMEOUT = (10, 60)
 
 
 class JiraService:
@@ -63,26 +65,26 @@ class JiraService:
             if on_progress:
                 on_progress(msg)
 
-        sprint_clause = " AND sprint in openSprints()" if active_sprints_only else ""
-        cutoff_str = cutoff_date.strftime("%Y-%m-%d")
+        use_active_sprints = bool(active_sprints_only)
+        sprint_clause = " AND sprint in openSprints()" if use_active_sprints else ""
+        cutoff_next_str = (cutoff_date + timedelta(days=1)).strftime("%Y-%m-%d")
 
         if start_date is not None:
             start_str = start_date.strftime("%Y-%m-%d")
             jql_active = (
                 f'project = "{project_key}" AND issuetype IN (Story, Bug) '
-                f'AND updated >= "{start_str}" AND created <= "{cutoff_str}"'
+                f'AND created < "{cutoff_next_str}" '
+                f'AND updated >= "{start_str}" AND updated < "{cutoff_next_str}" '
                 f'{sprint_clause} '
                 "ORDER BY updated DESC"
             )
-            excl = '"On Hold", "Discarded", "Done/Sign-Off", "Deployed to Production"'
             jql_carry = (
                 f'project = "{project_key}" AND issuetype IN (Story, Bug) '
                 f'AND created < "{start_str}" AND updated < "{start_str}" '
-                f'AND status NOT IN ({excl})'
                 f'{sprint_clause} '
                 "ORDER BY created DESC"
             )
-            sprint_label = "active sprints only" if active_sprints_only else "all sprints"
+            sprint_label = "active sprints only" if use_active_sprints else "all sprints"
             _log(f"Query 1/2 — Active window (updated >= {start_str}, {sprint_label}): fetching pages...")
             raw_active = self._search_issues(jql_active, hard_limit=max_results, on_progress=on_progress)
             _log(f"Query 1/2 done — {len(raw_active)} active tickets.")
@@ -98,11 +100,11 @@ class JiraService:
             jql = (
                 f'project = "{project_key}" '
                 "AND issuetype IN (Story, Bug) "
-                f'AND created <= "{cutoff_str}"'
+                f'AND created < "{cutoff_next_str}" '
                 f'{sprint_clause} '
                 "ORDER BY updated DESC"
             )
-            sprint_label = "active sprints only" if active_sprints_only else "all sprints"
+            sprint_label = "active sprints only" if use_active_sprints else "all sprints"
             _log(f"Running single JQL query ({sprint_label})...")
             raw_issues = self._search_issues(jql, hard_limit=max_results, on_progress=on_progress)
             _log(f"Query done — {len(raw_issues)} tickets.")
@@ -123,8 +125,9 @@ class JiraService:
                 module=self._extract_module_from_fields(fields, raw),
                 created_at=self._parse_datetime(fields.get("created")),
                 updated_at=self._parse_datetime(fields.get("updated")),
+                linked_dependency_keys=self._extract_linked_issue_keys(fields),
             )
-            ticket.transitions = self._fetch_changelog(key)
+            ticket.transitions, ticket.status_history = self._fetch_changelog(key)
             ticket.tasks = self._fetch_tasks(fields.get("subtasks") or [])
             tickets.append(ticket)
             if idx % 10 == 0 or idx == total:
@@ -145,7 +148,7 @@ class JiraService:
     def fetch_project_statuses(self, project_key: str) -> List[str]:
         """Return all unique status names configured for Story/Bug issue types in the project."""
         url = f"{self.server}/rest/api/3/project/{project_key}/statuses"
-        resp = requests.get(url, auth=self.auth, headers={"Accept": "application/json"})
+        resp = requests.get(url, auth=self.auth, headers={"Accept": "application/json"}, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         statuses: set = set()
         for issue_type in resp.json():
@@ -155,7 +158,7 @@ class JiraService:
                     if name:
                         statuses.add(name)
         if not statuses:
-            resp2 = requests.get(url, auth=self.auth, headers={"Accept": "application/json"})
+            resp2 = requests.get(url, auth=self.auth, headers={"Accept": "application/json"}, timeout=REQUEST_TIMEOUT)
             for issue_type in resp2.json():
                 for s in issue_type.get("statuses", []):
                     name = (s.get("name") or "").strip()
@@ -171,7 +174,7 @@ class JiraService:
         )
         payload = {"jql": jql, "maxResults": 300, "fields": ["labels"]}
         url = f"{self.server}/rest/api/3/search/jql"
-        resp = requests.post(url, json=payload, auth=self.auth, headers=self.headers)
+        resp = requests.post(url, json=payload, auth=self.auth, headers=self.headers, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         labels: set = set()
         for issue in resp.json().get("issues", []):
@@ -180,10 +183,68 @@ class JiraService:
                     labels.add(lbl.strip())
         return sorted(labels)
 
-    def _fetch_changelog(self, issue_key: str) -> Dict[str, List[datetime]]:
-        """Fetch all status transitions for an issue via the changelog endpoint."""
+    def fetch_dependency_todo_tickets(
+        self,
+        project_key: str,
+        linked_keys: set[str] | None = None,
+        on_progress=None,
+    ) -> Dict[str, JiraTicket]:
+        """Fetch Dependency tickets in To Do, optionally limited to linked keys."""
+        def _log(msg: str):
+            if on_progress:
+                on_progress(msg)
+
+        base_jql = (
+            f'project = "{project_key}" '
+            'AND issuetype = "Dependency" '
+            'AND status = "To Do" '
+            "ORDER BY updated DESC"
+        )
+
+        all_raw: List[Dict] = []
+        if linked_keys:
+            keys_sorted = sorted(k.strip() for k in linked_keys if k and k.strip())
+            chunk_size = 50
+            chunks = [keys_sorted[i:i + chunk_size] for i in range(0, len(keys_sorted), chunk_size)]
+            for idx, chunk in enumerate(chunks, 1):
+                key_clause = ", ".join(f'"{k}"' for k in chunk)
+                jql = (
+                    f'project = "{project_key}" '
+                    f'AND key IN ({key_clause}) '
+                    'AND issuetype = "Dependency" '
+                    'AND status = "To Do" '
+                    "ORDER BY updated DESC"
+                )
+                _log(f"Dependency query {idx}/{len(chunks)}...")
+                all_raw.extend(self._search_issues(jql))
+        else:
+            _log("Dependency query 1/1...")
+            all_raw = self._search_issues(base_jql)
+
+        dep_map: Dict[str, JiraTicket] = {}
+        for raw in all_raw:
+            fields = raw.get("fields", {})
+            key = raw.get("key")
+            if not key:
+                continue
+            dep_map[key] = JiraTicket(
+                key=key,
+                issue_type=fields.get("issuetype", {}).get("name", "Dependency"),
+                summary=fields.get("summary") or "",
+                description=self._extract_description(fields.get("description")),
+                status=fields.get("status", {}).get("name", ""),
+                labels=list(fields.get("labels") or []),
+                module="Dependencies",
+                created_at=self._parse_datetime(fields.get("created")),
+                updated_at=self._parse_datetime(fields.get("updated")),
+            )
+        return dep_map
+
+    def _fetch_changelog(self, issue_key: str) -> tuple[Dict[str, List[datetime]], List[StatusTransition]]:
+        """Fetch status transitions for an issue via the changelog endpoint."""
         url = f"{self.server}/rest/api/3/issue/{issue_key}/changelog"
         transitions: Dict[str, List[datetime]] = {}
+        status_history: List[StatusTransition] = []
         start_at = 0
 
         while True:
@@ -192,6 +253,7 @@ class JiraService:
                 params={"maxResults": 100, "startAt": start_at},
                 auth=self.auth,
                 headers={"Accept": "application/json"},
+                timeout=REQUEST_TIMEOUT,
             )
             if resp.status_code != 200:
                 break
@@ -202,12 +264,21 @@ class JiraService:
                     if item.get("field") != "status" or changed_at is None:
                         continue
                     to_status = item.get("toString", "")
+                    from_status = item.get("fromString", "")
                     transitions.setdefault(to_status, []).append(changed_at)
+                    status_history.append(
+                        StatusTransition(
+                            at=changed_at,
+                            from_status=from_status,
+                            to_status=to_status,
+                        )
+                    )
             total = data.get("total", 0)
             start_at += len(data.get("values", []))
             if start_at >= total or not data.get("values"):
                 break
-        return transitions
+        status_history.sort(key=lambda item: item.at)
+        return transitions, status_history
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -220,12 +291,13 @@ class JiraService:
         url = f"{self.server}/rest/api/3/search/jql"
         results: List[Dict] = []
         next_page_token: str | None = None
+        seen_tokens: set[str] = set()
         page_size = hard_limit if 0 < hard_limit <= 100 else 100
 
         fields = [
             "summary", "description", "status", "labels",
             "created", "updated", "subtasks", "components",
-            "issuetype", "parent",
+            "issuetype", "parent", "issuelinks",
         ]
         if self.module_field:
             fields.append(self.module_field)
@@ -239,7 +311,7 @@ class JiraService:
             if next_page_token:
                 payload["nextPageToken"] = next_page_token
 
-            resp = requests.post(url, json=payload, auth=self.auth, headers=self.headers)
+            resp = requests.post(url, json=payload, auth=self.auth, headers=self.headers, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             data = resp.json()
             issues = data.get("issues", [])
@@ -256,6 +328,11 @@ class JiraService:
             next_page_token = data.get("nextPageToken")
             if not next_page_token:
                 break
+            if next_page_token in seen_tokens:
+                if on_progress:
+                    on_progress("  Pagination token repeated; stopping to avoid loop.")
+                break
+            seen_tokens.add(next_page_token)
 
         return results
 
@@ -267,7 +344,8 @@ class JiraService:
                 continue
             url = f"{self.server}/rest/api/3/issue/{key}"
             params = {"fields": "summary,status,assignee,updated,description"}
-            resp = requests.get(url, params=params, auth=self.auth, headers=self.headers)
+            resp = requests.get(url, params=params, auth=self.auth, headers=self.headers, timeout=REQUEST_TIMEOUT)
+
             if resp.status_code != 200:
                 continue
             data = resp.json()
@@ -284,6 +362,21 @@ class JiraService:
                 )
             )
         return tasks
+
+    @staticmethod
+    def _extract_linked_issue_keys(fields: Dict) -> List[str]:
+        """Extract linked issue keys from Jira issue links for later dependency matching."""
+        keys: List[str] = []
+        seen: set[str] = set()
+        for link in (fields.get("issuelinks") or []):
+            for side in ("outwardIssue", "inwardIssue"):
+                issue = link.get(side) or {}
+                key = (issue.get("key") or "").strip()
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                keys.append(key)
+        return keys
 
     def _extract_module_from_fields(self, fields: Dict, raw: Dict) -> str:
         labels: List[str] = [str(l).strip() for l in (fields.get("labels") or []) if str(l).strip()]

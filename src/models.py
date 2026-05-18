@@ -49,6 +49,13 @@ class JiraTask:
 
 
 @dataclass
+class StatusTransition:
+    at: datetime
+    from_status: str
+    to_status: str
+
+
+@dataclass
 class JiraTicket:
     key: str
     issue_type: str
@@ -60,9 +67,11 @@ class JiraTicket:
     created_at: datetime | None
     updated_at: datetime | None
     tasks: List[JiraTask] = field(default_factory=list)
+    linked_dependency_keys: List[str] = field(default_factory=list)
     dependencies: List[str] = field(default_factory=list)
     ai_summary: str = ""
     transitions: Dict[str, List[datetime]] = field(default_factory=dict)
+    status_history: List[StatusTransition] = field(default_factory=list)
 
     @property
     def is_slcm(self) -> bool:
